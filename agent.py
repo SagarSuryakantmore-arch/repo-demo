@@ -1,6 +1,7 @@
 # agent.py
 
 import os
+import json
 from langchain_openai import AzureChatOpenAI
 from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -11,6 +12,10 @@ from azure_tools import (
     get_pipeline_runs,
     get_run_activity_logs,
     list_all_data_factories_in_subscription,
+    get_pipeline_definition,
+    update_pipeline,
+    create_pipeline_run,
+    get_pipeline_run,
 )
 
 llm = AzureChatOpenAI(
@@ -20,6 +25,7 @@ llm = AzureChatOpenAI(
     model_name=os.getenv("AZURE_OPENAI_MODEL_NAME"),
     api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
     streaming=True,
+    # temperature=0, # Set to 0 for deterministic JSON output
 )
 
 tools = [
@@ -27,6 +33,10 @@ tools = [
     get_pipeline_runs,
     get_run_activity_logs,
     list_all_data_factories_in_subscription,
+    get_pipeline_definition,
+    update_pipeline,
+    create_pipeline_run,
+    get_pipeline_run,
 ]
 
 system_prompt_template = """You are a helpful and expert assistant for Azure Data Factory.
@@ -76,6 +86,9 @@ class ChatAgent:
         return response.get("output", "Sorry, I encountered an error.")
 
 def get_error_analysis(error_message: str) -> str:
+    """
+    Asks the LLM to provide a human-readable analysis of an error message.
+    """
     analysis_prompt = f"""
     As an expert Azure Data Factory developer, please analyze the following error message from a pipeline run.
     Provide a clear, step-by-step explanation of the likely cause and suggest a solution.
@@ -86,11 +99,44 @@ def get_error_analysis(error_message: str) -> str:
     response = llm.invoke(analysis_prompt)
     return response.content
 
-# --- THIS FUNCTION WAS MISSING ---
+def get_pipeline_fix_json(pipeline_definition: str, error_message: str, activity_name: str) -> str:
+    """
+    Asks the LLM to analyze a pipeline definition and an error, and return a modified JSON to fix it.
+    """
+    analysis_prompt = f"""
+    You are an expert Azure Data Factory automated debugging agent. Your task is to fix a broken pipeline.
+    You will be given the full JSON definition of an ADF pipeline, the name of the failed activity, and the error message from that activity.
+    Your goal is to modify the pipeline JSON to correct the error.
+
+    **Instructions:**
+    1.  Analyze the provided `pipeline_definition` JSON and the `error_message`.
+    2.  Identify the root cause of the error within the activity named `{activity_name}`.
+    3.  Modify the JSON to implement a plausible fix. Common fixes might involve correcting typos in properties, changing linked service names, fixing dynamic content expressions, or adjusting activity settings.
+    4.  **Output Format**: You MUST respond in one of two formats:
+        a. **If a programmatic fix is possible**: Return ONLY the complete, modified, and valid JSON for the entire pipeline. Do not include any explanations, apologies, or introductory text. The output must be parsable as JSON.
+        b. **If a fix requires manual intervention**: If the error is due to expired credentials, incorrect permissions, network connectivity issues, or problems in external systems that cannot be fixed by modifying the pipeline JSON, return a JSON object with a single key "manual_intervention_required". The value should be a string explaining the problem and the steps the user must take manually. For example: {json.dumps({"manual_intervention_required": "The error indicates a credential issue with the source linked service 'AzureBlobStorage1'. Please navigate to the Azure portal, open this linked service, test the connection, and update the credentials."})}
+
+    **IMPORTANT**: Do not suggest placeholder changes. The modifications should be specific and directly address the error. Do not change the pipeline name or activity names.
+
+    ---
+    **Pipeline Definition (JSON):**
+    {pipeline_definition}
+    ---
+    **Failed Activity Name:**
+    {activity_name}
+    ---
+    **Error Message:**
+    {error_message}
+    ---
+
+    Now, provide your response based on the instructions.
+    """
+    response = llm.invoke(analysis_prompt)
+    return response.content
+
 def check_openai_connection():
     """Performs a quick, low-cost check to verify the OpenAI connection and credentials."""
     try:
-        # A minimal, non-streaming call to check the connection
         llm.invoke("test", config={"max_tokens": 5})
         return True
     except Exception as e:

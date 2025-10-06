@@ -2,12 +2,18 @@
 
 import streamlit as st
 import pandas as pd
-from agent import ChatAgent, get_error_analysis, check_openai_connection
+import json
+import time
+from agent import ChatAgent, get_error_analysis, check_openai_connection, get_pipeline_fix_json
 from azure_tools import (
     list_pipelines,
     get_pipeline_runs,
     get_run_activity_logs,
     list_all_data_factories_in_subscription,
+    get_pipeline_definition,
+    update_pipeline,
+    create_pipeline_run,
+    get_pipeline_run,
 )
 
 st.set_page_config(layout="wide", page_icon="🤖", page_title="ADF AI Agent")
@@ -28,6 +34,7 @@ def initialize_state():
         st.session_state.langchain_messages = []
     st.session_state.azure_status = "Disconnected"
     st.session_state.openai_status = "Disconnected"
+    st.session_state.fix_in_progress = None # To track which fix to run
 
     with st.spinner("Connecting to Azure..."):
         adfs = list_all_data_factories_in_subscription.invoke({})
@@ -37,7 +44,7 @@ def initialize_state():
         else:
             st.session_state.all_adfs = adfs
             st.session_state.azure_status = "Connected"
-    
+
     with st.spinner("Checking OpenAI connection..."):
         if check_openai_connection():
             st.session_state.openai_status = "Connected"
@@ -124,7 +131,7 @@ with st.sidebar:
         metric_card("OpenAI", st.session_state.openai_status, color_name=status_color_openai, icon="🤖")
     st.divider()
     if st.button("🔄 Refresh Data"):
-        keys_to_clear = ['initialized', 'all_adfs', 'error', 'azure_status', 'openai_status']
+        keys_to_clear = ['initialized', 'all_adfs', 'error', 'azure_status', 'openai_status', 'fix_in_progress']
         for key in keys_to_clear:
             if key in st.session_state:
                 del st.session_state[key]
@@ -173,56 +180,121 @@ elif page == "Pipelines":
         else:
             st.info(f"No runs found for pipeline '{pipeline_name}' in the last {days} days.")
 
-# -------- Error Diagnosis --------
 elif page == "Error Diagnosis":
     st.header("🔍 Error Diagnosis")
-    st.write("Select a pipeline run ID to view failed activities.")
+    st.write("Select a failed pipeline run ID to diagnose and attempt an automated fix.")
+    MAX_FIX_ATTEMPTS = 3
 
-    # Fetch all the runs for the past 30 days
-    all_runs = get_pipeline_runs.invoke({
-        "resource_group_name": st.session_state.selected_rg,
-        "data_factory_name": st.session_state.selected_adf,
-        "days": 30
-    })
+    # --- AUTO-FIX LOGIC (placed here to run outside the expander) ---
+    if st.session_state.fix_in_progress:
+        fix_data = st.session_state.fix_in_progress
+        activity = fix_data['activity']
+        pipeline_name = fix_data['pipeline_name']
+        current_error = activity.get('error', {})
+        
+        for attempt in range(MAX_FIX_ATTEMPTS):
+            with st.status(f"**Auto-Fix for '{pipeline_name}': Attempt {attempt + 1}**", expanded=True) as status:
+                try:
+                    # 1. Get current pipeline definition
+                    status.update(label="Fetching current pipeline definition...")
+                    pipeline_def = get_pipeline_definition.invoke({"resource_group_name": st.session_state.selected_rg, "data_factory_name": st.session_state.selected_adf, "pipeline_name": pipeline_name})
+                    if "error" in pipeline_def: raise ValueError(f"Failed to get pipeline definition: {pipeline_def['error']}")
 
-    # Extract the run IDs from the runs
-    run_options = [run['runId'] for run in all_runs] if all_runs else []
+                    # 2. Get AI-generated fix in JSON format
+                    status.update(label="Generating AI fix...")
+                    ai_fix_str = get_pipeline_fix_json(str(pipeline_def), str(current_error), activity['activityName'])
+                    fix_json = json.loads(ai_fix_str)
 
-    # Select the run ID from the list
-    selected_run_id = st.selectbox("Select Run ID", options=run_options)
+                    # 3. Check for manual intervention
+
+                    if "manual_intervention_required" in fix_json:
+                        # 1. Mark the status as 'complete' because the automated process is done.
+                        status.update(label="Auto-fix stopped. Manual action required.", state="complete")
+                        
+                        # 2. Display the actual warning message to the user outside the status context.
+                        st.warning(f"🤖 **AI Agent:** {fix_json['manual_intervention_required']}")
+                        
+                        # 3. Stop the loop.
+                        break
+
+                    # 4. Apply the fix
+                    status.update(label="Applying fix and updating pipeline...")
+                    update_result = update_pipeline.invoke({"resource_group_name": st.session_state.selected_rg, "data_factory_name": st.session_state.selected_adf, "pipeline_name": pipeline_name, "pipeline_definition": fix_json})
+                    if "error" in update_result: raise ValueError(f"Failed to update pipeline: {update_result['error']}")
+
+                    # 5. Retrigger
+                    status.update(label="Retriggering the pipeline...")
+                    new_run = create_pipeline_run.invoke({"resource_group_name": st.session_state.selected_rg, "data_factory_name": st.session_state.selected_adf, "pipeline_name": pipeline_name})
+                    if "error" in new_run: raise ValueError(f"Failed to retrigger pipeline: {new_run['error']}")
+                    new_run_id = new_run['runId']
+
+                    # 6. Monitor
+                    while True:
+                        status.update(label=f"Monitoring new run... (`{new_run_id}`)")
+                        time.sleep(10)
+                        run_status = get_pipeline_run.invoke({"resource_group_name": st.session_state.selected_rg, "data_factory_name": st.session_state.selected_adf, "run_id": new_run_id})
+                        if run_status['status'] == 'Succeeded':
+                            status.update(label=f"Pipeline fixed and ran successfully! 🎉", state="complete")
+                            st.balloons()
+                            solution_used = get_error_analysis(str(current_error))
+                            st.success(f"**Successfully fixed with the following logic:**\n\n{solution_used}")
+                            break
+                        elif run_status['status'] in ['Failed', 'Cancelled']:
+                            current_error = run_status.get('message', 'New run failed without a specific message.')
+                            raise RuntimeError(f"New run failed. Error: {current_error}")
+                
+                except (ValueError, RuntimeError, json.JSONDecodeError) as e:
+                    status.update(label=f"Attempt {attempt + 1} failed: {e}", state="error")
+                    if attempt < MAX_FIX_ATTEMPTS - 1:
+                        time.sleep(2) # Brief pause before next attempt
+                        continue
+                    else:
+                        st.error("Auto-fix failed after all attempts.")
+                break
+        
+        st.session_state.fix_in_progress = None # Clear the state after processing
+
+    # --- UI and Data Fetching ---
+    with st.spinner("Fetching recent pipeline runs..."):
+        all_runs = get_pipeline_runs.invoke({"resource_group_name": st.session_state.selected_rg, "data_factory_name": st.session_state.selected_adf, "days": 30})
+    
+    if not all_runs or isinstance(all_runs, str) or ("error" in all_runs[0]):
+        st.error(f"Could not fetch pipeline runs: {all_runs}")
+        st.stop()
+    
+    failed_runs = [run for run in all_runs if run['status'] == 'Failed']
+    # CORRECTED: Display Run ID in the selectbox for clarity
+    run_options = {run['runId']: f"{run['pipelineName']} ({run['runId']}) | {pd.to_datetime(run['runStart']).strftime('%Y-%m-%d %H:%M')}" for run in failed_runs}
+
+    selected_run_id = st.selectbox("Select Failed Run ID", options=list(run_options.keys()), format_func=lambda x: run_options.get(x, "Unknown Run"))
 
     if selected_run_id:
-        # Fetch the logs for the selected run ID
+        run_details = next((run for run in all_runs if run['runId'] == selected_run_id), None)
+        pipeline_name = run_details['pipelineName'] if run_details else None
+
         with st.spinner("Fetching activity logs..."):
-            logs = get_run_activity_logs.invoke({
-                "resource_group_name": st.session_state.selected_rg,
-                "data_factory_name": st.session_state.selected_adf,
-                "run_id": selected_run_id
-            })
+            logs = get_run_activity_logs.invoke({"resource_group_name": st.session_state.selected_rg, "data_factory_name": st.session_state.selected_adf, "run_id": selected_run_id})
         
-        # Filter failed activities
         failed_activities = [log for log in logs if log.get("status") == "Failed"]
 
-        # If no failed activities, show success message
         if not failed_activities:
-            st.success("No failed activities found for this run.")
+            st.success("No failed activities found for this run. The pipeline itself may have failed.")
+            st.json(run_details.get('message', 'No specific pipeline-level error message.'))
         else:
-            # Loop through each failed activity
             for activity in failed_activities:
-                # Expand each failed activity for better readability
-                with st.expander(f"❌ {activity['activityName']}"):
-                    # Show the activity log details in JSON format
-                    st.json(activity, expanded=False)
-
-                    # AI Suggestion button
-                    if st.button("Get AI Suggestion", key=f"ai_{selected_run_id}_{activity['activityName']}"):
-                        with st.spinner("Analyzing error with AI..."):
-                            # Analyzing the error using AI
-                            suggestion = get_error_analysis(str(activity.get('error', {})))
-                            # Display AI suggestion
-                            st.info(f"💡 **AI Suggestion:**\n{suggestion}")
-
-
+                with st.expander(f"❌ Failed Activity: **{activity['activityName']}**"):
+                    st.write("**Error Details:**")
+                    st.json(activity.get('error', {}))
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button("Get AI Suggestion", key=f"ai_{activity['activityName']}"):
+                            with st.spinner("Analyzing error with AI..."):
+                                st.info(f"💡 **AI Suggestion:**\n{get_error_analysis(str(activity.get('error', {})))}")
+                    with col2:
+                        if st.button("🚀 Fix Pipeline & Retrigger", key=f"fix_{activity['activityName']}"):
+                            # Set state to trigger the fix logic on rerun
+                            st.session_state.fix_in_progress = {'activity': activity, 'pipeline_name': pipeline_name}
+                            st.rerun()
 
 elif page == "Chat Assistance":
     st.header("💬 Chat Assistance")

@@ -1,12 +1,14 @@
 # azure_tools.py
 
 import os
-import re
+import time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from azure.identity import ClientSecretCredential
 from azure.mgmt.datafactory import DataFactoryManagementClient
 from azure.mgmt.resource import ResourceManagementClient
+from azure.mgmt.datafactory.models import PipelineResource
+from azure.core.exceptions import ResourceNotFoundError
 from langchain_core.tools import tool
 
 load_dotenv()
@@ -61,7 +63,6 @@ def list_pipelines(resource_group_name: str, data_factory_name: str) -> list:
         return [f"Error listing pipelines: {e}"]
 
 
-# --- MODIFIED: This function now returns the pipeline-level error message ---
 @tool
 def get_pipeline_runs(
     resource_group_name: str, data_factory_name: str, days: int, pipeline_name: str = None
@@ -88,7 +89,7 @@ def get_pipeline_runs(
                 "runStart": run.run_start.isoformat(),
                 "runEnd": run.run_end.isoformat() if run.run_end else "In Progress",
                 "durationInMs": run.duration_in_ms,
-                "message": run.message,  # <-- ADDED THIS FIELD
+                "message": run.message,
             }
             for run in runs.value
         ]
@@ -127,3 +128,82 @@ def get_run_activity_logs(
         ]
     except Exception as e:
         return [f"Error getting activity logs: {e}"]
+
+
+@tool
+def get_pipeline_definition(resource_group_name: str, data_factory_name: str, pipeline_name: str) -> dict:
+    """
+    Retrieves the full JSON definition of a specific pipeline.
+    This is needed to understand the pipeline's structure before attempting a fix.
+    """
+    try:
+        pipeline = adf_client.pipelines.get(
+            resource_group_name=resource_group_name,
+            factory_name=data_factory_name,
+            pipeline_name=pipeline_name,
+        )
+        return pipeline.as_dict()
+    except ResourceNotFoundError:
+        return {"error": f"Pipeline '{pipeline_name}' not found."}
+    except Exception as e:
+        return {"error": f"Error getting pipeline definition: {e}"}
+
+
+@tool
+def update_pipeline(resource_group_name: str, data_factory_name: str, pipeline_name: str, pipeline_definition: dict) -> dict:
+    """
+    Updates an existing pipeline with a new definition using the create_or_update operation.
+    The `pipeline_definition` must be a valid pipeline structure.
+    """
+    try:
+        pipeline_resource = PipelineResource(
+            activities=pipeline_definition.get('activities'),
+            parameters=pipeline_definition.get('parameters'),
+            variables=pipeline_definition.get('variables'),
+            annotations=pipeline_definition.get('annotations'),
+        )
+        updated_pipeline = adf_client.pipelines.create_or_update(
+            resource_group_name=resource_group_name,
+            factory_name=data_factory_name,
+            pipeline_name=pipeline_name,
+            pipeline=pipeline_resource
+        )
+        return {"status": "Success", "pipeline_name": updated_pipeline.name}
+    except Exception as e:
+        return {"error": f"Error updating pipeline: {e}"}
+
+
+@tool
+def create_pipeline_run(resource_group_name: str, data_factory_name: str, pipeline_name: str) -> dict:
+    """
+    Creates a new run for a specified pipeline and returns the run ID.
+    """
+    try:
+        run_response = adf_client.pipelines.create_run(
+            resource_group_name=resource_group_name,
+            factory_name=data_factory_name,
+            pipeline_name=pipeline_name,
+        )
+        return {"runId": run_response.run_id}
+    except Exception as e:
+        return {"error": f"Error creating pipeline run: {e}"}
+
+
+@tool
+def get_pipeline_run(resource_group_name: str, data_factory_name: str, run_id: str) -> dict:
+    """
+    Retrieves the details of a specific pipeline run, including its status.
+    """
+    try:
+        run = adf_client.pipeline_runs.get(
+            resource_group_name=resource_group_name,
+            factory_name=data_factory_name,
+            run_id=run_id,
+        )
+        return {
+            "runId": run.run_id,
+            "status": run.status,
+            "message": run.message,
+        }
+    except Exception as e:
+        return {"error": f"Error getting pipeline run status: {e}"}
